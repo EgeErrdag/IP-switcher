@@ -52,7 +52,7 @@ A Windows desktop app to quickly switch between static IP configurations and DHC
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ip-switcher-pro.git
+git clone https://github.com/EgeErrdag/ip-switcher-pro.git
 cd ip-switcher-pro
 pip install -r requirements.txt
 ```
