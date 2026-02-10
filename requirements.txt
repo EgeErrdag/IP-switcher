@@ -1,0 +1,4 @@
+customtkinter
+psutil
+wmi
+pywin32
