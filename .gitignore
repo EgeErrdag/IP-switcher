@@ -2,6 +2,6 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-saved_ips.json
+saved_ips.json*
 .env
 .claude/

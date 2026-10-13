@@ -8,10 +8,15 @@ A Windows desktop app to quickly switch between static IP configurations and DHC
 
 ## Features
 
-- **Adapter selection** — Dropdown lists all active network adapters with MAC identification
-- **Static IP configuration** — Set IP, subnet mask, gateway, and DNS in one click
+- **Adapter selection** — Dropdown lists network adapters with MAC identification, including unplugged physical adapters so you can configure them before connecting
+- **Live details** — Shows whether the adapter is on DHCP or static, plus its mask, gateway and DNS servers
+- **Static IP configuration** — Set IP, subnet mask, optional gateway, and primary/alternate DNS in one click
+- **Input checks** — Rejects invalid masks, network/broadcast addresses, and gateways outside the subnet before anything is changed
 - **DHCP mode** — Revert any adapter to automatic configuration instantly
-- **Saved profiles** — Store and load frequently used IP configurations
+- **Saved profiles** — Store and load complete configurations (IP, mask, gateway, both DNS servers); saving under an existing name updates it
+- **Use Current** — Copy the adapter's live settings into the form, e.g. to save them as a profile
+- **Fast entry** — Paste a full address into any box; `.` jumps to the next block
+- **Responsive UI** — Network changes and scans run in the background, so the window never freezes
 - **Auto-refresh** — Network status updates every 5 seconds
 - **Admin auto-elevation** — Automatically requests administrator privileges via UAC
 - **Dark UI** — Modern dark theme built with CustomTkinter
@@ -52,9 +57,9 @@ A Windows desktop app to quickly switch between static IP configurations and DHC
 ## Installation
 
 ```bash
-git clone https://github.com/EgeErrdag/ip-switcher-pro.git
-cd ip-switcher-pro
-pip install -r requirements.txt
+git clone https://github.com/EgeErrdag/IP-switcher.git
+cd IP-switcher
+py -m pip install -r requirements.txt
 ```
 
 ## Usage
@@ -70,9 +75,15 @@ The app will automatically request admin privileges if needed.
 
 ## How It Works
 
-- Uses `psutil` to detect active network adapters and their addresses
-- Applies network changes via Windows `netsh` commands
-- Profiles are saved locally to `saved_ips.json` (excluded from git)
+- Uses `psutil` to detect network adapters and their addresses, and WMI (`wmi` + `pywin32`) for DHCP state, gateway and DNS, since `netsh` output depends on the Windows language
+- Applies network changes via Windows `netsh interface ipv4` commands on a background thread
+- Profiles are saved locally to `saved_ips.json` (excluded from git). The file is written atomically, and if it ever becomes unreadable it is moved aside as `saved_ips.json.broken-<time>` instead of being overwritten
+
+## Tests
+
+```bash
+py -m unittest discover -s tests
+```
 
 ## License
 

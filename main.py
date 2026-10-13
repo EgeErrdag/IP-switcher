@@ -2,10 +2,15 @@ import customtkinter as ctk
 import psutil
 import socket
 import subprocess
+import threading
+import queue
+import ipaddress
+import re
 import sys
 import ctypes
 import json
 import os
+import time
 
 # Set theme
 ctk.set_appearance_mode("Dark")
@@ -14,6 +19,8 @@ ctk.set_default_color_theme("dark-blue")
 # Constants
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SAVED_IPS_FILE = os.path.join(SCRIPT_DIR, "saved_ips.json")
+REFRESH_MS = 5000
+IPV4_RE = re.compile(r"^\s*(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\s*$")
 
 # Color Palette
 BG_DARK = "#0f0f0f"
@@ -34,13 +41,205 @@ TEXT_SECONDARY = "#888888"
 TEXT_DIM = "#555555"
 
 
+# ── Pure helpers (no UI, covered by tests/) ─────────────
+
+def normalize_ipv4(text):
+    """Return a canonical dotted IPv4 string, or None if text is not one."""
+    match = IPV4_RE.match(text or "")
+    if not match:
+        return None
+    parts = [int(p) for p in match.groups()]
+    if any(p > 255 for p in parts):
+        return None
+    return ".".join(str(p) for p in parts)
+
+
+def validate_static_config(ip, mask, gateway=None, dns=()):
+    """Return an error message for an unusable static configuration, or None."""
+    if not ip:
+        return "IP address is required."
+    if not mask:
+        return "Subnet mask is required."
+    try:
+        net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+    except ValueError:
+        return f"{mask} is not a valid subnet mask."
+    if net.prefixlen == 0:
+        return "Subnet mask 0.0.0.0 is not usable."
+
+    addr = ipaddress.IPv4Address(ip)
+    if addr.is_loopback or addr.is_multicast or addr.is_unspecified or addr.is_reserved:
+        return f"{ip} cannot be assigned to an adapter."
+    if net.prefixlen < 31 and addr in (net.network_address, net.broadcast_address):
+        return f"{ip} is the network or broadcast address of {net}."
+
+    if gateway:
+        gw = ipaddress.IPv4Address(gateway)
+        if gw == addr:
+            return "Gateway cannot be the same as the IP address."
+        if gw not in net:
+            return f"Gateway {gateway} is outside {net}."
+
+    for server in dns:
+        if server and ipaddress.IPv4Address(server).is_unspecified:
+            return "DNS server 0.0.0.0 is not valid."
+    return None
+
+
+def build_static_commands(iface, ip, mask, gateway=None, dns1=None, dns2=None):
+    """netsh commands that set a static address and DNS list on iface."""
+    name = f"name={iface}"
+    cmds = [["netsh", "interface", "ipv4", "set", "address", name, "source=static",
+             f"address={ip}", f"mask={mask}", f"gateway={gateway or 'none'}"]]
+
+    servers = [s for s in (dns1, dns2) if s]
+    if servers:
+        cmds.append(["netsh", "interface", "ipv4", "set", "dnsservers", name, "source=static",
+                     f"address={servers[0]}", "register=primary", "validate=no"])
+        for index, server in enumerate(servers[1:], start=2):
+            cmds.append(["netsh", "interface", "ipv4", "add", "dnsservers", name,
+                         f"address={server}", f"index={index}", "validate=no"])
+    else:
+        cmds.append(["netsh", "interface", "ipv4", "set", "dnsservers", name,
+                     "source=static", "address=none", "validate=no"])
+    return cmds
+
+
+def build_dhcp_commands(iface):
+    name = f"name={iface}"
+    return [
+        ["netsh", "interface", "ipv4", "set", "address", name, "source=dhcp"],
+        ["netsh", "interface", "ipv4", "set", "dnsservers", name, "source=dhcp"],
+    ]
+
+
+def load_profiles(path):
+    """Read saved profiles. Returns (profiles, warning).
+
+    A file that cannot be read is moved aside instead of being treated as
+    empty, so the next save does not wipe the user's profiles.
+    """
+    if not os.path.exists(path):
+        return [], None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise ValueError("profile file is not a list")
+        return [p for p in data if isinstance(p, dict) and p.get("ip")], None
+    except (OSError, ValueError) as e:
+        backup = f"{path}.broken-{time.strftime('%Y%m%d-%H%M%S')}"
+        try:
+            os.replace(path, backup)
+            return [], f"Profile file was unreadable, moved to {os.path.basename(backup)}"
+        except OSError:
+            return [], f"Profile file is unreadable: {e}"
+
+
+def save_profiles(path, profiles):
+    """Write profiles atomically so a crash mid-write cannot corrupt the file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(profiles, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def query_wmi_details():
+    """Per-adapter DHCP/gateway/DNS details keyed by connection name.
+
+    Uses WMI because netsh output is localized. Returns {} if WMI is missing
+    or fails; the app then shows only what psutil knows.
+    """
+    try:
+        import pythoncom
+        import wmi
+    except ImportError:
+        return {}
+
+    pythoncom.CoInitialize()
+    try:
+        conn = wmi.WMI()
+        adapters = {}
+        for a in conn.query("SELECT Index, NetConnectionID, PhysicalAdapter "
+                            "FROM Win32_NetworkAdapter WHERE NetConnectionID IS NOT NULL"):
+            adapters[a.Index] = {"name": a.NetConnectionID, "physical": bool(a.PhysicalAdapter)}
+
+        details = {}
+        for cfg in conn.query("SELECT Index, DHCPEnabled, DefaultIPGateway, DNSServerSearchOrder "
+                              "FROM Win32_NetworkAdapterConfiguration"):
+            adapter = adapters.get(cfg.Index)
+            if not adapter:
+                continue
+            gateways = [g for g in (cfg.DefaultIPGateway or ()) if "." in g]
+            dns = [d for d in (cfg.DNSServerSearchOrder or ()) if "." in d]
+            details[adapter["name"]] = {
+                "physical": adapter["physical"],
+                "dhcp": bool(cfg.DHCPEnabled),
+                "gateway": gateways[0] if gateways else None,
+                "dns": dns,
+            }
+        return details
+    except Exception:
+        return {}
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def scan_adapters():
+    """Snapshot of usable adapters. Runs on a worker thread (WMI is slow)."""
+    stats = psutil.net_if_stats()
+    addrs = psutil.net_if_addrs()
+    details = query_wmi_details()
+    found = {}
+
+    for iface, stat in stats.items():
+        if "Loopback" in iface:
+            continue
+        extra = details.get(iface, {})
+        ip = mask = mac = None
+        for addr in addrs.get(iface, []):
+            if addr.family == socket.AF_INET:
+                ip, mask = addr.address, addr.netmask
+            elif addr.family == psutil.AF_LINK:
+                mac = addr.address
+
+        if stat.isup and not ip:
+            continue
+        # Unplugged adapters are listed too, so a static IP can be set before
+        # connecting the cable. Virtual ones stay hidden to keep the list short.
+        if not stat.isup and (not extra.get("physical") or "Bluetooth" in iface):
+            continue
+
+        found[iface] = {
+            "ip": ip,
+            "mask": mask,
+            "mac": mac or "??-??-??-??-??-??",
+            "up": stat.isup,
+            "dhcp": extra.get("dhcp"),
+            "gateway": extra.get("gateway"),
+            "dns": extra.get("dns", []),
+        }
+    return found
+
+
+def run_commands(cmds):
+    """Run netsh commands in order. Returns an error string, or None."""
+    for args in cmds:
+        result = subprocess.run(args, capture_output=True, text=True,
+                                encoding="oem", errors="replace",
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        if result.returncode != 0:
+            return result.stderr.strip() or result.stdout.strip() or "Unknown error"
+    return None
+
+
 class IPSwitcherApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("IP Switcher Pro")
-        self.geometry("1000x680")
-        self.minsize(900, 620)
+        self.geometry("1000x780")
+        self.minsize(900, 760)
         self.configure(fg_color=BG_DARK)
 
         self.grid_columnconfigure(1, weight=1)
@@ -50,11 +249,18 @@ class IPSwitcherApp(ctk.CTk):
         self.active_interface = None
         self.all_interfaces = {}
         self.display_to_name = {}
-        self.saved_ips = self.load_saved_ips()
+        self._results = queue.Queue()
+        self._scanning = False
+        self._busy = False
+        self._msg_after = None
+        self.saved_ips, load_warning = load_profiles(SAVED_IPS_FILE)
 
         self.setup_sidebar()
         self.setup_main_area()
+        self.poll_results()
         self.refresh_timer()
+        if load_warning:
+            self.show_message(load_warning, True)
 
     # ── Sidebar ──────────────────────────────────────────
 
@@ -112,7 +318,7 @@ class IPSwitcherApp(ctk.CTk):
 
     def setup_main_area(self):
         self.main_content = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_content.grid(row=0, column=1, padx=32, pady=32, sticky="nsew")
+        self.main_content.grid(row=0, column=1, padx=32, pady=24, sticky="nsew")
         self.main_content.grid_columnconfigure(0, weight=1)
 
         # ── Header Row ──
@@ -164,12 +370,28 @@ class IPSwitcherApp(ctk.CTk):
                                              text_color=TEXT_SECONDARY)
         self.lbl_current_mac.pack(pady=(0, 20), padx=24, anchor="w")
 
+        # ── Details Strip ──
+        details = ctk.CTkFrame(self.main_content, fg_color=BG_CARD, corner_radius=12,
+                               border_width=1, border_color=BORDER)
+        details.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+
+        self.lbl_details = ctk.CTkLabel(details, text="Mode: —   Mask: —   Gateway: —   DNS: —",
+                                         font=ctk.CTkFont(size=12, family="Consolas"),
+                                         text_color=TEXT_SECONDARY, anchor="w", justify="left")
+        self.lbl_details.pack(side="left", padx=24, pady=14, fill="x", expand=True)
+
+        self.btn_use_current = ctk.CTkButton(
+            details, text="Use Current", width=110, height=30,
+            font=ctk.CTkFont(size=11), fg_color=BORDER, hover_color=BORDER_LIGHT,
+            text_color=TEXT_SECONDARY, corner_radius=6, command=self.use_current_config)
+        self.btn_use_current.pack(side="right", padx=(8, 16), pady=10)
+
         # ── Config Card ──
         self.config_card = ctk.CTkFrame(self.main_content, fg_color=BG_CARD, corner_radius=12,
                                          border_width=1, border_color=BORDER)
-        self.config_card.grid(row=2, column=0, sticky="nsew", pady=(0, 0))
+        self.config_card.grid(row=3, column=0, sticky="nsew", pady=(0, 0))
         self.config_card.grid_columnconfigure(0, weight=1)
-        self.main_content.grid_rowconfigure(2, weight=1)
+        self.main_content.grid_rowconfigure(3, weight=1)
 
         # Config Header
         config_header = ctk.CTkFrame(self.config_card, fg_color="transparent")
@@ -178,7 +400,7 @@ class IPSwitcherApp(ctk.CTk):
                      font=ctk.CTkFont(size=15, weight="bold"), text_color=TEXT_PRIMARY).pack(side="left")
 
         # Message Label (in header, right side)
-        self.lbl_msg = ctk.CTkLabel(config_header, text="",
+        self.lbl_msg = ctk.CTkLabel(config_header, text="", wraplength=380, justify="right",
                                      font=ctk.CTkFont(size=11, weight="bold"), text_color=SUCCESS)
         self.lbl_msg.pack(side="right")
 
@@ -218,9 +440,12 @@ class IPSwitcherApp(ctk.CTk):
         self.entries_dns = self.frame_dns.entries
         self.fill_entries(self.entries_dns, "8.8.8.8")
 
+        self.frame_dns2 = self._add_ip_row("Alt. DNS", 5)
+        self.entries_dns2 = self.frame_dns2.entries
+
         # ── Action Buttons ──
         btn_frame = ctk.CTkFrame(self.config_card, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=28, pady=(24, 28))
+        btn_frame.pack(fill="x", padx=28, pady=(20, 24))
 
         self.btn_apply = ctk.CTkButton(
             btn_frame, text="Apply Settings", command=self.apply_static_ip,
@@ -260,6 +485,10 @@ class IPSwitcherApp(ctk.CTk):
                                  validate="key", validatecommand=validation_cmd)
             entry.pack(side="left", padx=1, pady=1)
             entry.bind("<KeyRelease>", lambda event, idx=i, entries=parent.entries: self.on_key_release(event, idx, entries))
+            entry.bind("<KeyPress-period>", lambda event, idx=i, entries=parent.entries: self.jump_next(idx, entries))
+            entry.bind("<KeyPress-KP_Decimal>", lambda event, idx=i, entries=parent.entries: self.jump_next(idx, entries))
+            entry.bind("<KeyPress-BackSpace>", lambda event, idx=i, entries=parent.entries: self.on_backspace(idx, entries))
+            entry.bind("<<Paste>>", lambda event, entries=parent.entries: self.on_paste(entries))
             parent.entries.append(entry)
 
             if i < 3:
@@ -269,18 +498,11 @@ class IPSwitcherApp(ctk.CTk):
 
     # ── Data Logic ───────────────────────────────────────
 
-    def load_saved_ips(self):
-        if os.path.exists(SAVED_IPS_FILE):
-            try:
-                with open(SAVED_IPS_FILE, "r") as f:
-                    return json.load(f)
-            except:
-                return []
-        return []
-
     def save_saved_ips(self):
-        with open(SAVED_IPS_FILE, "w") as f:
-            json.dump(self.saved_ips, f)
+        try:
+            save_profiles(SAVED_IPS_FILE, self.saved_ips)
+        except OSError as e:
+            self.show_message(f"Could not save profiles: {e}", True)
         self.refresh_saved_list()
 
     def refresh_saved_list(self):
@@ -303,10 +525,17 @@ class IPSwitcherApp(ctk.CTk):
             info_frame = ctk.CTkFrame(row, fg_color="transparent")
             info_frame.pack(side="left", fill="x", expand=True, padx=(12, 0), pady=10)
 
+            subtitle = item.get('ip', '')
+            try:
+                prefix = ipaddress.IPv4Network(f"0.0.0.0/{item['subnet']}").prefixlen
+                subtitle = f"{subtitle}/{prefix}"
+            except (KeyError, ValueError):
+                pass
+
             ctk.CTkLabel(info_frame, text=item.get('name', 'Profile'),
                          font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_PRIMARY,
                          anchor="w").pack(anchor="w")
-            ctk.CTkLabel(info_frame, text=item.get('ip', ''),
+            ctk.CTkLabel(info_frame, text=subtitle,
                          font=ctk.CTkFont(size=10, family="Consolas"), text_color=TEXT_DIM,
                          anchor="w").pack(anchor="w")
 
@@ -326,39 +555,72 @@ class IPSwitcherApp(ctk.CTk):
             del_btn.pack(side="right", pady=8)
 
     def delete_saved_ip(self, index):
+        name = self.saved_ips[index].get("name", "Profile")
         del self.saved_ips[index]
         self.save_saved_ips()
+        self.show_message(f"Deleted '{name}'", False)
 
     def save_current_input_as_profile(self):
         ip = self.get_ip_from_entries(self.entries_ip)
-        gateway = self.get_ip_from_entries(self.entries_gateway)
         if not ip:
             self.show_message("Enter an IP address first.", True)
             return
 
         dialog = ctk.CTkInputDialog(text="Profile name:", title="Save Profile")
-        name = dialog.get_input()
-        if name:
-            profile = {"name": name, "ip": ip}
-            if gateway:
-                profile["gateway"] = gateway
-            self.saved_ips.append(profile)
-            self.save_saved_ips()
-            self.show_message(f"Saved '{name}'", False)
+        name = (dialog.get_input() or "").strip()
+        if not name:
+            return
+
+        profile = {"name": name, "ip": ip}
+        for key, entries in (("subnet", self.entries_subnet), ("gateway", self.entries_gateway),
+                             ("dns", self.entries_dns), ("dns2", self.entries_dns2)):
+            value = self.get_ip_from_entries(entries)
+            if value:
+                profile[key] = value
+
+        # Saving under an existing name updates that profile instead of duplicating it
+        for i, existing in enumerate(self.saved_ips):
+            if existing.get("name", "").lower() == name.lower():
+                self.saved_ips[i] = profile
+                self.save_saved_ips()
+                self.show_message(f"Updated '{name}'", False)
+                return
+
+        self.saved_ips.append(profile)
+        self.save_saved_ips()
+        self.show_message(f"Saved '{name}'", False)
 
     def load_profile_to_entries(self, item):
-        self.fill_entries(self.entries_ip, "")
-        self.fill_entries(self.entries_gateway, "")
-
         self.fill_entries(self.entries_ip, item.get('ip', ''))
+        self.fill_entries(self.entries_subnet, item.get('subnet', '255.255.255.0'))
+        self.fill_entries(self.entries_dns, item.get('dns', ''))
+        self.fill_entries(self.entries_dns2, item.get('dns2', ''))
+
         if 'gateway' in item:
             self.fill_entries(self.entries_gateway, item['gateway'])
-        elif 'ip' in item:
-            parts = item['ip'].split('.')
-            if len(parts) == 4:
-                self.fill_entries(self.entries_gateway, f"{parts[0]}.{parts[1]}.{parts[2]}.1")
+        elif 'subnet' in item:
+            # Saved with every field: no gateway means it was left empty on purpose
+            self.fill_entries(self.entries_gateway, "")
+        else:
+            # Profiles from older versions stored only the IP; guess x.y.z.1
+            parts = item.get('ip', '').split('.')
+            self.fill_entries(self.entries_gateway,
+                              f"{parts[0]}.{parts[1]}.{parts[2]}.1" if len(parts) == 4 else "")
 
         self.show_message(f"Loaded '{item.get('name')}'", False)
+
+    def use_current_config(self):
+        info = self.all_interfaces.get(self.active_interface)
+        if not info or not info["ip"]:
+            self.show_message("Selected adapter has no IPv4 address.", True)
+            return
+        dns = info["dns"] + ["", ""]
+        self.fill_entries(self.entries_ip, info["ip"])
+        self.fill_entries(self.entries_subnet, info["mask"] or "255.255.255.0")
+        self.fill_entries(self.entries_gateway, info["gateway"] or "")
+        self.fill_entries(self.entries_dns, dns[0])
+        self.fill_entries(self.entries_dns2, dns[1])
+        self.show_message("Copied current settings", False)
 
     def fill_entries(self, entries, ip_str):
         for e in entries:
@@ -371,10 +633,7 @@ class IPSwitcherApp(ctk.CTk):
                 entries[i].insert(0, part)
 
     def get_ip_from_entries(self, entries):
-        parts = [e.get() for e in entries]
-        if any(p == "" or not p.isdigit() for p in parts):
-            return None
-        return ".".join(parts)
+        return normalize_ipv4(".".join(e.get() for e in entries))
 
     def validate_entry(self, value):
         if value == "":
@@ -388,96 +647,153 @@ class IPSwitcherApp(ctk.CTk):
     def on_key_release(self, event, idx, entries):
         val = entries[idx].get()
         if len(val) == 3 and idx < 3:
-            if not (event.keysym == "BackSpace" or event.keysym.startswith("Left")):
+            if not (event.keysym == "BackSpace" or event.keysym.startswith("Left")
+                    or event.keysym in ("Tab", "ISO_Left_Tab")):
                 entries[idx + 1].focus_set()
         if val.isdigit() and int(val) > 255:
             entries[idx].delete(0, 'end')
             entries[idx].insert(0, "255")
 
+    def jump_next(self, idx, entries):
+        if idx < 3 and entries[idx].get():
+            entries[idx + 1].focus_set()
+            entries[idx + 1].select_range(0, 'end')
+        return "break"
+
+    def on_backspace(self, idx, entries):
+        if idx > 0 and entries[idx].get() == "":
+            entries[idx - 1].focus_set()
+            entries[idx - 1].icursor('end')
+            return "break"
+        return None
+
+    def on_paste(self, entries):
+        try:
+            text = self.clipboard_get()
+        except Exception:
+            return "break"
+        ip = normalize_ipv4(text)
+        if ip:
+            self.fill_entries(entries, ip)
+            entries[3].focus_set()
+        return "break"
+
     def show_message(self, text, is_error=False):
+        if self._msg_after:
+            self.after_cancel(self._msg_after)
         self.lbl_msg.configure(text=text, text_color=DANGER if is_error else SUCCESS)
-        self.after(4000, lambda: self.lbl_msg.configure(text=""))
+        self._msg_after = self.after(6000 if is_error else 4000, self._clear_message)
+
+    def _clear_message(self):
+        self._msg_after = None
+        self.lbl_msg.configure(text="")
+
+    # ── Background Work ──────────────────────────────────
+
+    def run_in_background(self, work, on_done):
+        """Run work() off the UI thread; on_done(result) runs on the UI thread."""
+        def target():
+            try:
+                result = work()
+            except Exception as e:
+                result = e
+            self._results.put((on_done, result))
+        threading.Thread(target=target, daemon=True).start()
+
+    def poll_results(self):
+        while True:
+            try:
+                on_done, result = self._results.get_nowait()
+            except queue.Empty:
+                break
+            on_done(result)
+        self.after(100, self.poll_results)
+
+    def set_busy(self, busy, text=""):
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        for btn in (self.btn_apply, self.btn_dhcp, self.btn_use_current):
+            btn.configure(state=state)
+        if busy:
+            if self._msg_after:
+                self.after_cancel(self._msg_after)
+                self._msg_after = None
+            self.lbl_msg.configure(text=text, text_color=WARNING)
 
     # ── Network Logic ────────────────────────────────────
 
     def refresh_timer(self):
-        self.get_network_info()
-        self.after(5000, self.refresh_timer)
+        self.request_scan()
+        self.after(REFRESH_MS, self.refresh_timer)
+
+    def request_scan(self):
+        if self._scanning:
+            return
+        self._scanning = True
+        self.run_in_background(scan_adapters, self.on_scan_done)
+
+    def on_scan_done(self, found):
+        self._scanning = False
+        if isinstance(found, Exception):
+            return
+        self.update_adapter_list(found)
 
     def on_adapter_selected(self, choice):
         iface_name = self.display_to_name.get(choice)
         if iface_name and iface_name in self.all_interfaces:
             self.active_interface = iface_name
-            info = self.all_interfaces[iface_name]
-            self.lbl_current_ip.configure(text=info["ip"])
-            self.lbl_current_mac.configure(text=info["mac"])
-            self.lbl_interface.configure(text=iface_name, text_color=SUCCESS)
-            self.status_dot.configure(text_color=SUCCESS)
+            self.update_status_display()
 
-    def get_network_info(self):
-        try:
-            stats = psutil.net_if_stats()
-            addrs = psutil.net_if_addrs()
-            found = {}
+    @staticmethod
+    def display_name(name, info):
+        state = "" if info["up"] else "  (not connected)"
+        return f"{name}  [{info['mac']}]{state}"
 
-            for iface, stat in stats.items():
-                if not stat.isup or iface not in addrs:
-                    continue
-                if "Loopback" in iface:
-                    continue
-                ip = None
-                mac = None
-                for addr in addrs[iface]:
-                    if addr.family == socket.AF_INET:
-                        ip = addr.address
-                    elif addr.family == -1:
-                        mac = addr.address
-                if ip:
-                    found[iface] = {"ip": ip, "mac": mac or "??-??-??-??-??-??"}
+    def update_adapter_list(self, found):
+        old_names = {n: self.display_name(n, i) for n, i in self.all_interfaces.items()}
+        new_names = {n: self.display_name(n, i) for n, i in found.items()}
+        self.all_interfaces = found
 
-            prev_interfaces = set(self.all_interfaces.keys())
-            self.all_interfaces = found
+        if new_names != old_names:
+            self.display_to_name = {d: n for n, d in new_names.items()}
+            # Connected adapters first
+            ordered = sorted(found, key=lambda n: (not found[n]["up"], n.lower()))
+            display_names = [new_names[n] for n in ordered] or ["No adapters found"]
+            self.adapter_dropdown.configure(values=display_names)
 
-            if set(found.keys()) != prev_interfaces:
-                self.display_to_name = {}
-                display_names = []
-                for name, info in found.items():
-                    display = f"{name}  [{info['mac']}]"
-                    display_names.append(display)
-                    self.display_to_name[display] = name
+            if self.active_interface not in found:
+                self.active_interface = ordered[0] if ordered else None
+            self.adapter_var.set(new_names[self.active_interface] if self.active_interface
+                                 else "No adapters found")
 
-                if not display_names:
-                    display_names = ["No adapters found"]
+        self.update_status_display()
 
-                self.adapter_dropdown.configure(values=display_names)
+    def update_status_display(self):
+        info = self.all_interfaces.get(self.active_interface)
+        if not info:
+            self.lbl_interface.configure(text="No adapter", text_color=DANGER)
+            self.status_dot.configure(text_color=DANGER)
+            self.lbl_current_ip.configure(text="---.---.---.---")
+            self.lbl_current_mac.configure(text="--:--:--:--:--:--")
+            self.lbl_details.configure(text="Mode: —   Mask: —   Gateway: —   DNS: —")
+            return
 
-                if self.active_interface not in found and found:
-                    first_name = list(found.keys())[0]
-                    self.active_interface = first_name
-                    for d, n in self.display_to_name.items():
-                        if n == first_name:
-                            self.adapter_var.set(d)
-                            break
-                elif not found:
-                    self.active_interface = None
-                    self.adapter_var.set("No adapters found")
+        color = SUCCESS if info["up"] else WARNING
+        label = self.active_interface if info["up"] else f"{self.active_interface} · not connected"
+        self.lbl_interface.configure(text=label, text_color=color)
+        self.status_dot.configure(text_color=color)
+        self.lbl_current_ip.configure(text=info["ip"] or "---.---.---.---")
+        self.lbl_current_mac.configure(text=info["mac"])
 
-            if self.active_interface and self.active_interface in found:
-                info = found[self.active_interface]
-                self.lbl_interface.configure(text=self.active_interface, text_color=SUCCESS)
-                self.status_dot.configure(text_color=SUCCESS)
-                self.lbl_current_ip.configure(text=info["ip"])
-                self.lbl_current_mac.configure(text=info["mac"])
-            else:
-                self.lbl_interface.configure(text="Disconnected", text_color=DANGER)
-                self.status_dot.configure(text_color=DANGER)
-                self.lbl_current_ip.configure(text="---.---.---.---")
-                self.lbl_current_mac.configure(text="--:--:--:--:--:--")
-
-        except Exception:
-            pass
+        mode = {True: "DHCP", False: "Static", None: "—"}[info["dhcp"]]
+        dns = ", ".join(info["dns"]) or "—"
+        self.lbl_details.configure(
+            text=f"Mode: {mode}   Mask: {info['mask'] or '—'}   "
+                 f"Gateway: {info['gateway'] or '—'}   DNS: {dns}")
 
     def apply_static_ip(self):
+        if self._busy:
+            return
         if not self.active_interface:
             self.show_message("No active interface!", True)
             return
@@ -485,56 +801,48 @@ class IPSwitcherApp(ctk.CTk):
         new_ip = self.get_ip_from_entries(self.entries_ip)
         subnet = self.get_ip_from_entries(self.entries_subnet)
         gateway = self.get_ip_from_entries(self.entries_gateway)
-        dns = self.get_ip_from_entries(self.entries_dns)
+        dns1 = self.get_ip_from_entries(self.entries_dns)
+        dns2 = self.get_ip_from_entries(self.entries_dns2)
 
-        if not new_ip or not subnet or not gateway:
-            self.show_message("IP, Subnet, and Gateway are required!", True)
+        for label, entries, value in (("Gateway", self.entries_gateway, gateway),
+                                      ("DNS", self.entries_dns, dns1),
+                                      ("Alt. DNS", self.entries_dns2, dns2)):
+            if not value and any(e.get() for e in entries):
+                self.show_message(f"{label} is incomplete.", True)
+                return
+
+        error = validate_static_config(new_ip, subnet, gateway, (dns1, dns2))
+        if error:
+            self.show_message(error, True)
             return
 
-        self.lbl_msg.configure(text="Applying...", text_color=WARNING)
-        self.update_idletasks()
-
-        cmds = [
-            f'netsh interface ip set address "{self.active_interface}" static {new_ip} {subnet} {gateway}',
-        ]
-        if dns:
-            cmds.append(f'netsh interface ip set dns "{self.active_interface}" static {dns}')
-        else:
-            cmds.append(f'netsh interface ip set dns "{self.active_interface}" static 8.8.8.8')
-
-        try:
-            for c in cmds:
-                result = subprocess.run(c, shell=True, capture_output=True, text=True)
-                if result.returncode != 0:
-                    err = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                    self.show_message(f"Failed: {err[:80]}", True)
-                    return
-            self.show_message("Applied successfully", False)
-            self.after(2000, self.get_network_info)
-        except Exception as e:
-            self.show_message(f"Error: {str(e)}", True)
+        iface = self.active_interface
+        cmds = build_static_commands(iface, new_ip, subnet, gateway, dns1, dns2)
+        self.set_busy(True, "Applying...")
+        self.run_in_background(lambda: run_commands(cmds),
+                               lambda err: self.on_command_done(err, f"Applied to {iface}"))
 
     def set_dhcp(self):
+        if self._busy:
+            return
         if not self.active_interface:
+            self.show_message("No active interface!", True)
             return
 
-        self.lbl_msg.configure(text="Switching to DHCP...", text_color=WARNING)
-        self.update_idletasks()
+        iface = self.active_interface
+        self.set_busy(True, "Switching to DHCP...")
+        self.run_in_background(lambda: run_commands(build_dhcp_commands(iface)),
+                               lambda err: self.on_command_done(err, f"{iface} switched to DHCP"))
 
-        try:
-            for c in [
-                f'netsh interface ip set address "{self.active_interface}" source=dhcp',
-                f'netsh interface ip set dns "{self.active_interface}" source=dhcp',
-            ]:
-                result = subprocess.run(c, shell=True, capture_output=True, text=True)
-                if result.returncode != 0:
-                    err = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                    self.show_message(f"Failed: {err[:80]}", True)
-                    return
-            self.show_message("Switched to DHCP", False)
-            self.after(2000, self.get_network_info)
-        except Exception as e:
-            self.show_message(f"Error: {str(e)}", True)
+    def on_command_done(self, error, success_text):
+        self.set_busy(False)
+        if isinstance(error, Exception):
+            self.show_message(f"Error: {error}", True)
+        elif error:
+            self.show_message(f"Failed: {error[:160]}", True)
+        else:
+            self.show_message(success_text, False)
+        self.after(2000, self.request_scan)
 
 
 def is_admin():
