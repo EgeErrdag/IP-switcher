@@ -74,6 +74,16 @@ The app will automatically request admin privileges if needed.
 - Applies network changes via Windows `netsh` commands
 - Profiles are saved locally to `saved_ips.json` (excluded from git)
 
+## Website
+
+A Turkish, animated landing page that explains the app lives in `website/`. To open it on localhost:
+
+```bash
+python website/serve.py
+```
+
+or double-click `website/baslat.bat`. It opens http://localhost:8000 (or the next free port). No dependencies beyond Python.
+
 ## License
 
 MIT

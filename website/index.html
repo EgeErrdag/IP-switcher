@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IP Switcher Pro</title>
+  <meta name="description" content="IP Switcher Pro: Windows'ta IP adresini tek tıkla değiştiren uygulamanın en basit anlatımı.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="blobs" aria-hidden="true">
+    <span class="blob b1"></span><span class="blob b2"></span><span class="blob b3"></span>
+  </div>
+
+  <nav class="nav">
+    <a class="logo" href="#top"><span class="logo-dot"></span>IP Switcher</a>
+    <div class="nav-links">
+      <a href="#nedir">Nedir?</a>
+      <a href="#dene">Dene</a>
+      <a href="#kurulum">Kurulum</a>
+      <a href="#kullanim">Kullanım</a>
+      <a href="#sss">SSS</a>
+    </div>
+  </nav>
+
+  <!-- HERO -->
+  <header class="hero" id="top">
+    <canvas id="net" aria-hidden="true"></canvas>
+    <div class="hero-inner">
+      <p class="pill reveal">Windows için · Ücretsiz · Açık kaynak</p>
+      <h1 class="reveal">
+        Bilgisayarının <span class="grad">adresini</span><br>
+        tek tıkla değiştir.
+      </h1>
+      <p class="lead reveal">
+        IP Switcher, bilgisayarının internetteki “ev adresini” elle ayarlamanı
+        ya da otomatiğe almanı sağlayan küçük bir uygulama.
+        Komut yazmak yok, menülerde kaybolmak yok.
+      </p>
+      <div class="ip-show reveal" aria-live="polite">
+        <span class="ip-label">Şu anki IP</span>
+        <span class="ip-value" id="heroIp">192.168.1.25</span>
+      </div>
+      <div class="cta reveal">
+        <a class="btn primary" href="#dene">Hemen dene 👇</a>
+        <a class="btn ghost" href="#kurulum">Nasıl kurarım?</a>
+      </div>
+    </div>
+    <div class="scroll-hint" aria-hidden="true"><span></span></div>
+  </header>
+
+  <!-- NEDİR -->
+  <section id="nedir" class="section">
+    <h2 class="reveal">Çok basit anlatalım 🍼</h2>
+    <p class="sub reveal">Hiç bilgisayar bilmeyen biri için bile.</p>
+
+    <div class="story">
+      <div class="story-card reveal">
+        <div class="emoji float">🏠</div>
+        <h3>IP adresi = ev adresi</h3>
+        <p>İnternete bağlanan her cihazın bir adresi var. Mektuplar (yani veriler) bu adrese gelir. Buna <b>IP adresi</b> denir. Örnek: <code>192.168.1.25</code></p>
+      </div>
+      <div class="story-card reveal">
+        <div class="emoji float d1">📮</div>
+        <h3>DHCP = postacı adres verir</h3>
+        <p>Normalde modem sana kendisi bir adres verir. Sen hiçbir şey yapmazsın. Buna <b>DHCP</b> yani “otomatik” denir.</p>
+      </div>
+      <div class="story-card reveal">
+        <div class="emoji float d2">✍️</div>
+        <h3>Statik IP = adresi sen seçersin</h3>
+        <p>Bazen (iş yerinde, bir cihaza bağlanırken, kamerada, PLC'de…) adresi <b>senin</b> yazman gerekir. Buna <b>statik IP</b> denir.</p>
+      </div>
+      <div class="story-card reveal">
+        <div class="emoji float d3">🔁</div>
+        <h3>Sorun ne?</h3>
+        <p>Windows'ta bunu değiştirmek 7-8 pencere açmak demek. Her gün yapıyorsan çok can sıkıcı.</p>
+      </div>
+    </div>
+
+    <div class="solution reveal">
+      <div class="sol-before">
+        <h4>😩 Eskiden</h4>
+        <ol class="clicks">
+          <li>Denetim Masası</li><li>Ağ ve İnternet</li><li>Ağ Merkezi</li>
+          <li>Bağdaştırıcı ayarları</li><li>Sağ tık → Özellikler</li>
+          <li>IPv4 → Özellikler</li><li>Hepsini elle yaz</li><li>Tamam, Tamam, Tamam…</li>
+        </ol>
+      </div>
+      <div class="arrow-big" aria-hidden="true">➜</div>
+      <div class="sol-after">
+        <h4>😎 IP Switcher ile</h4>
+        <div class="one-click">
+          <span class="big-btn pulse">Apply Settings</span>
+          <p>Bitti. Bu kadar.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DENE (simülasyon) -->
+  <section id="dene" class="section">
+    <h2 class="reveal">Kendin dene 🎮</h2>
+    <p class="sub reveal">Aşağıdaki pencere uygulamanın aynısı gibi çalışır. Gerçek ağına dokunmaz, sadece oyuncak.</p>
+
+    <div class="app reveal" id="app">
+      <div class="app-titlebar">
+        <span class="tdot r"></span><span class="tdot y"></span><span class="tdot g"></span>
+        <span class="app-title">IP Switcher Pro</span>
+      </div>
+      <div class="app-body">
+        <aside class="app-side">
+          <div class="side-title"><b>IP Switcher</b><small>Network Manager</small></div>
+          <div class="side-head"><span>PROFILES</span><span class="count" id="profCount">2</span></div>
+          <div class="profiles" id="profiles"></div>
+          <button class="side-save" id="saveBtn">+ Save Current Config</button>
+        </aside>
+        <main class="app-main">
+          <div class="app-head">
+            <h3>Dashboard</h3>
+            <span class="badge"><span class="bdot"></span><span id="ifaceName">Ethernet</span></span>
+          </div>
+          <div class="cards">
+            <div class="card">
+              <small>Current IP</small>
+              <strong id="curIp">192.168.1.25</strong>
+              <em id="curMode" class="mode dhcp">DHCP</em>
+            </div>
+            <div class="card">
+              <small>MAC Address</small>
+              <strong>A4-5E-60-1C-9B-07</strong>
+            </div>
+          </div>
+          <div class="config">
+            <div class="config-head"><h4>Configuration</h4><span id="msg" class="msg"></span></div>
+            <label class="row"><span>Adapter</span>
+              <select id="adapter"><option>Ethernet</option><option>Wi-Fi</option></select>
+            </label>
+            <div class="row"><span>IP Address</span><div class="oct" data-f="ip"></div></div>
+            <div class="row"><span>Subnet</span><div class="oct" data-f="mask"></div></div>
+            <div class="row"><span>Gateway</span><div class="oct" data-f="gw"></div></div>
+            <div class="row"><span>DNS Server</span><div class="oct" data-f="dns"></div></div>
+            <div class="actions">
+              <button class="abtn apply" id="applyBtn">Apply Settings</button>
+              <button class="abtn dhcp" id="dhcpBtn">DHCP Mode</button>
+            </div>
+          </div>
+        </main>
+      </div>
+    </div>
+    <p class="hint reveal">💡 İpucu: Soldan bir profile <b>Load</b> de, sonra <b>Apply Settings</b>'e bas. Ya da <b>DHCP Mode</b> ile otomatiğe dön.</p>
+  </section>
+
+  <!-- KURULUM -->
+  <section id="kurulum" class="section">
+    <h2 class="reveal">Kurulum: 4 adım 🛠️</h2>
+    <p class="sub reveal">Sadece Windows 10 / 11'de çalışır.</p>
+
+    <ol class="steps">
+      <li class="step reveal">
+        <div class="num">1</div>
+        <div>
+          <h3>Python'u kur</h3>
+          <p><a href="https://www.python.org/downloads/" target="_blank" rel="noopener">python.org</a>'dan Python 3.10 veya üstünü indir. Kurarken <b>“Add Python to PATH”</b> kutusunu mutlaka işaretle.</p>
+        </div>
+      </li>
+      <li class="step reveal">
+        <div class="num">2</div>
+        <div>
+          <h3>Projeyi indir</h3>
+          <p>GitHub'da yeşil <b>Code → Download ZIP</b> de ve bir klasöre çıkar. Ya da:</p>
+          <div class="code"><code>git clone https://github.com/EgeErrdag/IP-switcher.git</code><button class="copy">Kopyala</button></div>
+        </div>
+      </li>
+      <li class="step reveal">
+        <div class="num">3</div>
+        <div>
+          <h3>Gerekenleri yükle</h3>
+          <p>Klasörün içinde bir terminal aç ve yaz:</p>
+          <div class="code"><code>pip install -r requirements.txt</code><button class="copy">Kopyala</button></div>
+        </div>
+      </li>
+      <li class="step reveal">
+        <div class="num">4</div>
+        <div>
+          <h3>Çalıştır</h3>
+          <p><code class="inline">run.bat</code> dosyasına çift tıkla. Ya da:</p>
+          <div class="code"><code>python main.py</code><button class="copy">Kopyala</button></div>
+          <p class="note">🛡️ Windows “Bu uygulamanın değişiklik yapmasına izin verilsin mi?” diye sorar. <b>Evet</b> de. IP değiştirmek için yönetici izni şart.</p>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <!-- KULLANIM -->
+  <section id="kullanim" class="section">
+    <h2 class="reveal">Nasıl kullanılır? 📖</h2>
+    <p class="sub reveal">Ne yapmak istiyorsan ona tıkla.</p>
+
+    <div class="tabs reveal" role="tablist">
+      <button class="tab active" data-tab="t1" role="tab">✍️ Elle IP ver</button>
+      <button class="tab" data-tab="t2" role="tab">📮 Otomatiğe dön</button>
+      <button class="tab" data-tab="t3" role="tab">💾 Profil kaydet</button>
+      <button class="tab" data-tab="t4" role="tab">⚡ Profil yükle</button>
+    </div>
+
+    <div class="panels reveal">
+      <div class="panel active" id="t1">
+        <ol class="flow">
+          <li><span>1</span><b>Adapter</b> listesinden kabloyu (Ethernet) veya Wi-Fi'ı seç.</li>
+          <li><span>2</span><b>IP Address</b> kutularına istediğin adresi yaz. Ör: <code>192.168.1.50</code></li>
+          <li><span>3</span><b>Subnet</b> genelde <code>255.255.255.0</code> olur.</li>
+          <li><span>4</span><b>Gateway</b> modemin adresidir, genelde <code>192.168.1.1</code>.</li>
+          <li><span>5</span><b>DNS</b> boş kalırsa <code>8.8.8.8</code> kullanılır.</li>
+          <li><span>6</span>Mor <b>Apply Settings</b> düğmesine bas. Yeşil “Applied successfully” yazısını gör. ✅</li>
+        </ol>
+      </div>
+      <div class="panel" id="t2">
+        <ol class="flow">
+          <li><span>1</span>Adapter'ı seç.</li>
+          <li><span>2</span>Yeşil <b>DHCP Mode</b> düğmesine bas.</li>
+          <li><span>3</span>“Switched to DHCP” yazar. Modem sana yine kendisi adres verir. 🎉</li>
+        </ol>
+        <p class="tip">Ne yaptığını bilmiyorsan ve internet gittiyse: <b>DHCP Mode</b>'a bas. Çoğu zaman her şeyi eski haline getirir.</p>
+      </div>
+      <div class="panel" id="t3">
+        <ol class="flow">
+          <li><span>1</span>Kutulara sık kullandığın ayarları yaz.</li>
+          <li><span>2</span>Sol alttaki <b>+ Save Current Config</b> düğmesine bas.</li>
+          <li><span>3</span>Bir isim ver: “Ofis”, “Ev”, “Kamera” gibi.</li>
+          <li><span>4</span>Profil soldaki listede belirir. Bilgisayar kapansa da kaybolmaz.</li>
+        </ol>
+      </div>
+      <div class="panel" id="t4">
+        <ol class="flow">
+          <li><span>1</span>Soldaki listede profili bul.</li>
+          <li><span>2</span><b>Load</b> düğmesine bas, bilgiler kutulara dolar.</li>
+          <li><span>3</span><b>Apply Settings</b> ile uygula.</li>
+          <li><span>4</span>Silmek istersen kırmızı <b>x</b>'e bas.</li>
+        </ol>
+        <p class="tip">⚠️ Profil sadece IP ve Gateway'i hatırlar. Subnet ve DNS'i yüklemeden önce bir kontrol et.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- SSS -->
+  <section id="sss" class="section">
+    <h2 class="reveal">Sık sorulanlar 🤔</h2>
+    <div class="faq">
+      <details class="reveal"><summary>Mac veya Linux'ta çalışır mı?</summary><p>Hayır. Windows'un kendi <code>netsh</code> aracını kullandığı için sadece Windows 10/11'de çalışır.</p></details>
+      <details class="reveal"><summary>Neden yönetici izni istiyor?</summary><p>Windows, ağ ayarlarının sadece yönetici tarafından değiştirilmesine izin verir. Uygulama açılırken bu izni kendisi ister.</p></details>
+      <details class="reveal"><summary>Bilgisayarı bozar mı?</summary><p>Hayır. Sadece ağ adresini değiştirir. Bir sorun olursa <b>DHCP Mode</b> ile otomatiğe dönersin.</p></details>
+      <details class="reveal"><summary>İnternetim gitti, ne yapayım?</summary><p>Büyük ihtimalle yanlış Gateway veya IP yazdın. <b>DHCP Mode</b>'a bas, internet geri gelir.</p></details>
+      <details class="reveal"><summary>Profillerim nerede saklanıyor?</summary><p>Uygulamanın klasöründeki <code>saved_ips.json</code> dosyasında. Bu dosyayı kopyalarsan profillerin de taşınır.</p></details>
+      <details class="reveal"><summary>Ekran 5 saniyede bir değişiyor, normal mi?</summary><p>Evet. Uygulama her 5 saniyede bir güncel IP'ni kontrol edip gösterir.</p></details>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <p>IP Switcher Pro · Python + CustomTkinter ile yapıldı ·
+      <a href="https://github.com/EgeErrdag/IP-switcher" target="_blank" rel="noopener">GitHub</a></p>
+  </footer>
+
+  <div class="toast" id="toast"></div>
+  <script src="script.js"></script>
+</body>
+</html>
